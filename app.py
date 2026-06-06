@@ -315,6 +315,95 @@ def calculate_piotroski(ticker_obj):
         return None
 
 
+def calculate_risk_reward(hist_price, risk_free_rate=0.02):
+    """Sharpe-ähnliches Chancen-Risiko-Verhältnis aus 1-Jahres-Kurshistorie.
+    Returns: (sharpe, annual_return, annual_vol, max_drawdown) — alle als float oder None."""
+    try:
+        if hist_price is None or hist_price.empty:
+            return None, None, None, None
+        closes = hist_price["Close"].tail(252)  # letzte ~252 Handelstage = 1 Jahr
+        if len(closes) < 30:
+            return None, None, None, None
+        returns = closes.pct_change().dropna()
+        if len(returns) < 30:
+            return None, None, None, None
+
+        # Annualisierte Rendite (geometrisch)
+        n = len(closes)
+        annual_return = ((closes.iloc[-1] / closes.iloc[0]) ** (252.0 / n)) - 1
+        # Annualisierte Volatilität
+        annual_vol = float(returns.std() * (252 ** 0.5))
+        if annual_vol == 0:
+            return None, float(annual_return), 0.0, None
+        sharpe = (float(annual_return) - risk_free_rate) / annual_vol
+
+        # Max Drawdown (zusätzlich, für Diagnose)
+        rolling_max = closes.cummax()
+        drawdown = (closes / rolling_max - 1)
+        max_dd = float(drawdown.min())
+
+        return float(sharpe), float(annual_return), annual_vol, max_dd
+    except Exception:
+        return None, None, None, None
+
+
+def calculate_dividend_growth(ticker_obj):
+    """Dividendenwachstums-Analyse: CAGR der letzten 5 Jahre, Streak konsekutiver Steigerungen.
+    Returns: dict mit 'cagr_5y' (in %), 'streak' (Jahre), 'score' (0–4), 'max_score'."""
+    result = {"cagr_5y": None, "streak": 0, "score": None, "max_score": 0}
+    try:
+        divs = ticker_obj.dividends
+        if divs is None or divs.empty:
+            return result
+
+        # Auf Jahressummen aggregieren (manche Firmen zahlen quartalsweise)
+        annual = divs.groupby(divs.index.year).sum().sort_index()
+        # Letztes Jahr ggf. noch unvollständig → ausschließen, wenn aktuelle Jahresummen
+        # unter dem Median der Vorjahre liegen (Heuristik)
+        if len(annual) >= 2 and annual.index[-1] >= pd.Timestamp.now().year:
+            if annual.iloc[-1] < annual.iloc[:-1].median() * 0.5:
+                annual = annual.iloc[:-1]
+
+        if len(annual) < 2:
+            return result
+
+        # CAGR über die letzten 5 vollen Jahre (oder so viel wie verfügbar, min 3)
+        window = min(5, len(annual))
+        if window >= 3:
+            recent = annual.tail(window)
+            start, end = float(recent.iloc[0]), float(recent.iloc[-1])
+            years = window - 1
+            if start > 0 and years > 0:
+                cagr = ((end / start) ** (1.0 / years) - 1) * 100
+                result["cagr_5y"] = float(cagr)
+
+        # Streak: konsekutive Jahre mit Steigerung (vom aktuellsten rückwärts)
+        streak = 0
+        for i in range(len(annual) - 1, 0, -1):
+            if annual.iloc[i] > annual.iloc[i - 1]:
+                streak += 1
+            else:
+                break
+        result["streak"] = int(streak)
+
+        # Score 0–4
+        score = 0
+        max_score = 4
+        if result["cagr_5y"] is not None:
+            if result["cagr_5y"] >= 10: score += 2
+            elif result["cagr_5y"] >= 5: score += 1
+            elif result["cagr_5y"] >= 0: score += 0  # Stagnation: 0 Punkte
+            # Schrumpfung: negativer Wert, keine Punkte
+        if streak >= 5: score += 2
+        elif streak >= 3: score += 1
+
+        result["score"] = score
+        result["max_score"] = max_score
+        return result
+    except Exception:
+        return result
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_ticker_data(ticker):
     """Holt alle relevanten Fundamentaldaten."""
@@ -324,6 +413,9 @@ def fetch_ticker_data(ticker):
         "market_cap": None, "beta": None, "rd_ratio": None,
         "piotroski": None, "hist_pe_median": None, "hist_price": None,
         "news": [], "error": None,
+        # Neue Felder
+        "sharpe": None, "annual_return": None, "annual_vol": None, "max_drawdown": None,
+        "div_cagr_5y": None, "div_streak": 0, "div_growth_score": None, "div_growth_max": 0,
     }
     try:
         t = yf.Ticker(ticker)
@@ -361,6 +453,20 @@ def fetch_ticker_data(ticker):
             pass
 
         result["piotroski"] = calculate_piotroski(t)
+
+        # Chancen-Risiko-Verhältnis
+        sharpe, ann_ret, ann_vol, max_dd = calculate_risk_reward(result["hist_price"])
+        result["sharpe"] = sharpe
+        result["annual_return"] = ann_ret
+        result["annual_vol"] = ann_vol
+        result["max_drawdown"] = max_dd
+
+        # Dividendenwachstum
+        div_info = calculate_dividend_growth(t)
+        result["div_cagr_5y"] = div_info["cagr_5y"]
+        result["div_streak"] = div_info["streak"]
+        result["div_growth_score"] = div_info["score"]
+        result["div_growth_max"] = div_info["max_score"]
 
         # Historisches KGV (vereinfacht)
         try:
@@ -609,6 +715,32 @@ if fetch_fundamentals:
         else:
             future = "⚠️ Schwach"
 
+        # Chancen-Risiko-Verhältnis (Sharpe-Ratio, 1J)
+        sharpe = md.get("sharpe")
+        if sharpe is not None:
+            if sharpe > 1.0: crv_label = f"🟢 {sharpe:+.2f}"
+            elif sharpe > 0.5: crv_label = f"🟡 {sharpe:+.2f}"
+            elif sharpe > 0: crv_label = f"🟠 {sharpe:+.2f}"
+            else: crv_label = f"🔴 {sharpe:+.2f}"
+        else:
+            crv_label = "—"
+
+        # Dividendenwachstums-Score
+        dg_score = md.get("div_growth_score")
+        dg_max = md.get("div_growth_max", 0)
+        dg_cagr = md.get("div_cagr_5y")
+        dg_streak = md.get("div_streak", 0)
+        if dg_score is None or dg_max == 0:
+            dg_label = "—"
+        else:
+            # Score 0–4 zu Sternen
+            stars = "★" * dg_score + "☆" * (dg_max - dg_score)
+            dg_label = f"{stars} ({dg_cagr:+.1f}%, {dg_streak}J)" if dg_cagr is not None else stars
+
+        # KBV (Kurs-Buchwert-Verhältnis) — sektorabhängig, keine fixe Farbe
+        pb = md.get("pb")
+        pb_label = round(pb, 2) if pb and pb > 0 else "—"
+
         rows.append({
             "Name": r["Name"][:40],
             "Gattung": r["Gattung"],
@@ -617,23 +749,44 @@ if fetch_fundamentals:
             "Perf %": round(r["Performance %"], 1) if pd.notna(r["Performance %"]) else "—",
             "KGV": round(pe, 1) if pe else "—",
             "KGV 5J-Med": round(hist_pe, 1) if hist_pe else "—",
+            "KBV": pb_label,
             "Bewertung": hist_val,
             "PEG": round(peg, 2) if peg else "—",
             "F&E %": round(rd, 1) if rd is not None else "—",
             "Piotroski": f"{piot}/9" if piot is not None else "—",
             "Zukunft": future,
+            "CRV (Sharpe)": crv_label,
             "Div %": round(md.get("dividend_yield", 0) * 100, 2) if md.get("dividend_yield") else "—",
+            "Div-Wachstum": dg_label,
         })
     df_analysis = pd.DataFrame(rows).sort_values("Wert €", ascending=False)
     st.dataframe(df_analysis, use_container_width=True, hide_index=True)
 
-    with st.expander("ℹ️ Interpretation"):
+    with st.expander("ℹ️ Interpretation der Kennzahlen"):
         st.markdown("""
+**Bewertungs- und Fundamentaldaten:**
 - **KGV vs. 5J-Median**: ≥ 15 % darüber = historisch teuer.
-- **PEG < 1**: Klassisch günstig im Verhältnis zum erwarteten Gewinnwachstum.
+- **KBV (Kurs-Buchwert-Verhältnis)**: Marktkapitalisierung / Eigenkapital. **Stark sektorabhängig** — bei Banken/Versicherern (Allianz, Hannover Rück, Münchener Rück) ist KBV 0,8–1,5 normal, KBV < 1 = Aktie unter Substanzwert. Bei Tech-Werten (Microsoft, Apple) ist KBV 10+ normal, weil Bilanz wenig immaterielle Vermögen abbildet. Niemals zwischen Branchen vergleichen.
+- **PEG < 1,5**: Klassisch günstig im Verhältnis zum erwarteten Gewinnwachstum.
 - **F&E-Quote**: F&E am Umsatz. Tech > 10 %, Konsumgüter < 3 %.
 - **Piotroski F-Score (0–9)**: 9 Bilanzkriterien (Profitabilität, Leverage, Effizienz). ≥ 7 stark.
-- **—**: Keine Yahoo-Daten verfügbar (häufig bei ETFs, kleinen Werten, Zertifikaten).
+
+**Chancen-Risiko-Verhältnis (Sharpe-Ratio, 1-Jahres-Basis):**
+Annualisierte Rendite minus Risikolos-Zins (2 %) geteilt durch annualisierte Volatilität.
+Misst, wie viel zusätzliche Rendite pro Einheit eingegangenes Schwankungsrisiko erzielt wurde.
+- 🟢 **> 1,0**: Sehr gut — Rendite schlägt Risiko deutlich
+- 🟡 **0,5 – 1,0**: Solide
+- 🟠 **0 – 0,5**: Mager
+- 🔴 **< 0**: Negative risikobereinigte Rendite (Verlust oder Underperformance Risikolos-Zins)
+
+**Dividendenwachstums-Score (0–4 Sterne):**
+Kombination aus zwei Faktoren — je 0–2 Punkte für:
+- **CAGR der Dividende (5J)**: ≥ 10 % p. a. → 2 Punkte, ≥ 5 % → 1 Punkt
+- **Streak**: konsekutive Jahre mit Dividendenanhebung. ≥ 5 J → 2 Punkte, ≥ 3 J → 1 Punkt
+
+Beispiel `★★★☆ (+8,2%, 4J)`: 3 von 4 Sternen, Dividende wuchs 8,2 % p. a., 4 Jahre konsekutive Steigerungen.
+
+**Ein Gedankenstrich (—)** bedeutet: Yahoo liefert keine verwertbaren Daten (häufig bei ETFs, Zertifikaten, Microcaps, oder weil das Unternehmen gar keine Dividende zahlt).
         """)
 
     st.markdown("---")
